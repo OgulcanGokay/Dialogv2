@@ -1,0 +1,7 @@
+{
+  "name": "Dia-Log",
+  "description": "A predictive app for mitigating glycemic volatility via personalized dietary analysis and behavioral tracking.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
