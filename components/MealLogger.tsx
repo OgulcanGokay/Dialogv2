@@ -6,7 +6,7 @@ import { MealAnalysis, EnhancedMealPrediction, HealthContext, MealType, Glycemic
 import { Camera, Upload, Check, Loader2, Info, AlertTriangle, History, Trash2, Activity, Moon, Zap, TrendingUp, ChevronDown, ChevronUp, Search, Filter, X, Coffee, Sun, Sunset, Cookie } from 'lucide-react';
 
 const MealLogger: React.FC = () => {
-  const { apiKey, user, meals, sleep, moods, activities, logMealFromAnalysis, deleteMeal, getFilteredMeals } = useApp();
+  const { apiKey, user, meals, sleep, moods, activities, logMealFromAnalysis, deleteMeal, getFilteredMeals, getRecentGlucosePoints } = useApp();
 
   const [image, setImage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -68,8 +68,25 @@ const MealLogger: React.FC = () => {
         setPortionSize(mealResult.portionSize);
       }
 
-      // Step 2: Generate enhanced prediction with health context
-      const enhanced = await generateEnhancedPrediction(apiKey, mealResult, healthContext);
+      // Step 2: Generate enhanced prediction with health context (also call local ML /predict)
+      const recentGlucose = getRecentGlucosePoints(30); // 10-30+ points
+
+      const mealTypeTitle =
+        mealType === "breakfast" ? "Breakfast" :
+        mealType === "lunch" ? "Lunch" :
+        mealType === "dinner" ? "Dinner" :
+        "Snack";
+
+      const enhanced = await generateEnhancedPrediction(
+        apiKey,
+        mealResult,
+        healthContext,
+        {
+          userId: user?.id || "001",
+          mealType: mealTypeTitle,
+          recentGlucose,
+        }
+      );
       setEnhancedPrediction(enhanced);
     } catch (err) {
       console.error(err);
@@ -392,22 +409,39 @@ const MealLogger: React.FC = () => {
                 <div className="flex items-center gap-2 mb-2">
                   <TrendingUp className="text-indigo-500" size={18} />
                   <h4 className="font-semibold text-slate-800 text-sm">Glucose Prediction</h4>
+
+                  {enhancedPrediction?.ml && (
+                    <span className="ml-auto px-2 py-1 rounded-full text-xs font-bold bg-slate-100 text-slate-700">
+                      Confidence: {enhancedPrediction.ml.confidence.toUpperCase()} (n={enhancedPrediction.ml.n})
+                    </span>
+                  )}
                 </div>
+
                 <div className="grid grid-cols-3 gap-2 mb-3">
                   <div className="text-center">
                     <p className="text-lg font-bold text-indigo-600">+{enhancedPrediction.glucoseEstimate.expectedPeak}</p>
                     <p className="text-xs text-slate-400">mg/dL peak</p>
                   </div>
+
                   <div className="text-center">
                     <p className="text-lg font-bold text-slate-700">{enhancedPrediction.glucoseEstimate.peakTime}</p>
                     <p className="text-xs text-slate-400">min to peak</p>
                   </div>
+
                   <div className="text-center">
                     <p className="text-lg font-bold text-slate-700">{enhancedPrediction.glucoseEstimate.returnToBaseline}</p>
                     <p className="text-xs text-slate-400">min to normal</p>
                   </div>
                 </div>
-                <p className="text-sm text-slate-600">{enhancedPrediction.contextualPrediction}</p>
+
+                {enhancedPrediction?.ml && (
+                  <p className="text-sm text-slate-600 mt-3">
+                    ML Predicted glucose: <b>{Math.round(enhancedPrediction.ml.predicted_glucose)}</b> mg/dL
+                    <span className="text-xs text-slate-400"> ({enhancedPrediction.ml.mode})</span>
+                  </p>
+                )}
+
+                <p className="text-sm text-slate-600 mt-3">{enhancedPrediction.contextualPrediction}</p>
               </div>
             )}
 

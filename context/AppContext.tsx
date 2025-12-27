@@ -17,6 +17,7 @@ import {
     MealType
 } from '../types';
 import * as dataService from '../services/dataService';
+import { predictGlucose, predictMealResponse } from '../services/predictApi';
 
 // ============================================
 // Context Types
@@ -62,6 +63,7 @@ interface AppContextType {
     // Utilities
     getTodaysMeals: () => MealEntry[];
     getTodaysGlucose: () => GlucoseEntry[];
+    getRecentGlucosePoints: (count?: number) => { ts?: string; value: number }[];
     getRecentLogs: (limit?: number) => DailyLog[];
     getCurrentGlucose: () => GlucoseEntry | null;
     getDailyStats: () => {
@@ -72,6 +74,34 @@ interface AppContextType {
         totalCarbs: number;
         mealsLogged: number;
     };
+
+    // Prediction state/actions
+    predictionResult: null | {
+        mode: "full" | "fallback" | "min";
+        delta: number;
+        predicted: number;
+        last: number;
+        n: number;
+        confidence?: "low" | "medium" | "high";
+    };
+    predictionLoading: boolean;
+    predictionError: string | null;
+    runPrediction: () => Promise<void>;
+
+    mealResponseResult: null | {
+        mode: "meal_response";
+        baseline_glucose: number;
+        premeal_slope: number;
+        d_peak: number;
+        t_peak: number;
+        auc_0_120: number;
+        decay_slope: number;
+        predicted_peak_glucose: number;
+        confidence?: "low" | "medium" | "high";
+    };
+    mealResponseLoading: boolean;
+    mealResponseError: string | null;
+    runMealResponsePrediction: () => Promise<void>;
 
     // Data Management
     refreshData: () => void;
@@ -105,6 +135,33 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const [apiKey, setApiKeyState] = useState<string>(
         localStorage.getItem('gemini_api_key') || ''
     );
+
+    // Prediction UI state
+    const [predictionResult, setPredictionResult] = useState<null | {
+        mode: "full" | "fallback" | "min";
+        delta: number;
+        predicted: number;
+        last: number;
+        n: number;
+        confidence?: "low" | "medium" | "high";
+    }>(null);
+    const [predictionLoading, setPredictionLoading] = useState<boolean>(false);
+    const [predictionError, setPredictionError] = useState<string | null>(null);
+
+    const [mealResponseResult, setMealResponseResult] = useState<null | {
+        mode: "meal_response";
+        baseline_glucose: number;
+        premeal_slope: number;
+        d_peak: number;
+        t_peak: number;
+        auc_0_120: number;
+        decay_slope: number;
+        predicted_peak_glucose: number;
+        confidence?: "low" | "medium" | "high";
+    }>(null);
+
+    const [mealResponseLoading, setMealResponseLoading] = useState<boolean>(false);
+    const [mealResponseError, setMealResponseError] = useState<string | null>(null);
 
     // ============================================
     // Initial Data Load
@@ -270,6 +327,18 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         return glucose.filter(g => dataService.isToday(g.timestamp));
     }, [glucose]);
 
+    // newest-first glucose[] -> last N points as {ts,value} oldest->newest
+    const getRecentGlucosePoints = useCallback((count: number = 30) => {
+        return glucose
+            .filter(g => typeof g.value === "number" && !Number.isNaN(g.value))
+            .slice(0, count)            // newest-first
+            .reverse()                  // oldest -> newest
+            .map(g => ({
+                ts: (g as any).timestamp ?? (g as any).ts,
+                value: Number(g.value),
+            }));
+    }, [glucose]);
+
     const getCurrentGlucose = useCallback((): GlucoseEntry | null => {
         return glucose.length > 0 ? glucose[0] : null;
     }, [glucose]);
@@ -400,6 +469,109 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     }, [refreshData]);
 
     // ============================================
+    // Prediction action
+    // ============================================
+    const runPrediction = useCallback(async () => {
+        try {
+            setPredictionLoading(true);
+            setPredictionError(null);
+
+            // 1) sort by timestamp (safe) + take last 30
+            const sorted = [...glucose].sort(
+                (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+            );
+            const recent = sorted.slice(-30);
+
+            if (recent.length < 1) {
+                setPredictionLoading(false);
+                setPredictionError('No glucose data to predict.');
+                return;
+            }
+
+            const payload = {
+                user_id: user?.id ?? '001',
+                meal_type: 'Lunch',
+                glucose: recent.map((g) => ({ ts: g.timestamp, value: g.value })),
+            };
+
+            const r = await predictGlucose(payload);
+
+            const last = r.last_glucose ?? recent[recent.length - 1].value;
+            const predicted = r.predicted_glucose ?? (last + r.prediction);
+
+            console.log("Predict response r:", r);
+            console.log("computed last/predicted:", { last, predicted });
+
+            setPredictionResult({
+                mode: r.mode,
+                delta: r.prediction,
+                predicted,
+                last,
+                n: r.n,
+                confidence: r.confidence,
+            });
+
+            setPredictionLoading(false);
+        } catch (e: any) {
+            setPredictionLoading(false);
+            setPredictionError(e?.message ?? 'Prediction failed');
+        }
+    }, [glucose, user]);
+
+    const runMealResponsePrediction = useCallback(async () => {
+        try {
+            setMealResponseLoading(true);
+            setMealResponseError(null);
+
+            // aynı şekilde son 30 glukoz noktası
+            const sorted = [...glucose].sort(
+                (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+            );
+            const recent = sorted.slice(-30);
+
+            if (recent.length < 3) {
+                setMealResponseLoading(false);
+                setMealResponseError('Not enough glucose data (need at least 3 points).');
+                return;
+            }
+
+            // meal macro’ları: en mantıklısı son loglanan meal (yoksa 0)
+            const lastMeal = meals.length > 0 ? meals[0] : null;
+
+            const payload = {
+                glucose: recent.map((g) => ({ ts: g.timestamp, value: Number(g.value) })),
+                latest_ts: recent[recent.length - 1].timestamp,
+                meal_type: (lastMeal?.mealType as any) ?? "Unknown",
+                calories: lastMeal?.analysis?.estimatedCalories ?? 0,
+                carbs: lastMeal?.analysis?.estimatedCarbs ?? 0,
+                protein: lastMeal?.analysis?.estimatedProtein ?? 0,
+                fat: lastMeal?.analysis?.estimatedFat ?? 0,
+                fiber: lastMeal?.analysis?.estimatedFiber ?? 0,
+                amount_consumed: 1,
+            };
+
+            const r = await predictMealResponse(payload);
+
+            setMealResponseResult({
+                mode: r.mode,
+                baseline_glucose: r.baseline_glucose,
+                premeal_slope: r.premeal_slope,
+                d_peak: r.d_peak,
+                t_peak: r.t_peak,
+                auc_0_120: r.auc_0_120,
+                decay_slope: r.decay_slope,
+                predicted_peak_glucose: r.predicted_peak_glucose,
+                confidence: r.confidence,
+            });
+
+            setMealResponseLoading(false);
+        } catch (e: any) {
+            setMealResponseLoading(false);
+            setMealResponseError(e?.message ?? 'Meal-response prediction failed');
+        }
+    }, [glucose, meals]);
+
+    // ============================================
     // Context Value
     // ============================================
 
@@ -443,6 +615,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         // Utilities
         getTodaysMeals,
         getTodaysGlucose,
+        getRecentGlucosePoints,
         getRecentLogs,
         getCurrentGlucose,
         getDailyStats,
@@ -452,6 +625,17 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         exportData,
         importData,
         clearAllData
+        ,
+        // Prediction
+        predictionResult,
+        predictionLoading,
+        predictionError,
+        runPrediction
+        ,
+        mealResponseResult,
+        mealResponseLoading,
+        mealResponseError,
+        runMealResponsePrediction
     };
 
     return (

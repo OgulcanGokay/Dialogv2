@@ -6,7 +6,8 @@ import { GlucoseReading, HealthContext, GlucoseTrend } from '../types';
 import { TrendingUp, AlertCircle, Droplet, Clock, Utensils, Activity, Moon, Zap, Brain, CheckCircle, Plus, Trash2, X } from 'lucide-react';
 
 const Dashboard: React.FC = () => {
-  const { user, glucose, meals, sleep, moods, activities, getTodaysMeals, getDailyStats, addGlucoseReading, deleteGlucoseReading } = useApp();
+  const { user, glucose, meals, sleep, moods, activities, getTodaysMeals, getDailyStats, addGlucoseReading, deleteGlucoseReading,
+    runPrediction, predictionResult, predictionLoading, predictionError } = useApp();
   const [healthContext, setHealthContext] = useState<HealthContext | null>(null);
 
   // Glucose entry form state
@@ -124,6 +125,28 @@ const Dashboard: React.FC = () => {
               : "Let's work on improving your glucose control today."}
         </p>
       </header>
+
+      {/* Prediction quick action */}
+      <div className="mb-4">
+        <button
+          onClick={runPrediction}
+          disabled={predictionLoading}
+          className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-60"
+        >
+          {predictionLoading ? 'Predicting...' : 'Predict Glucose'}
+        </button>
+
+        {predictionError && <p className="text-red-500 mt-2">{predictionError}</p>}
+
+        {predictionResult && (
+          <div className="mt-3 p-3 bg-white rounded-xl border border-slate-100 inline-block">
+            <p className="text-sm">Mode: {predictionResult.mode} (n={predictionResult.n})</p>
+            <p className="text-sm">Last: {predictionResult.last}</p>
+            <p className="text-sm">Δ Pred: {predictionResult.delta.toFixed(2)}</p>
+            <p className="text-sm font-bold">Predicted: {predictionResult.predicted.toFixed(2)}</p>
+          </div>
+        )}
+      </div>
 
       {/* AI Health Summary Card */}
       {healthContext && (
@@ -392,7 +415,7 @@ const Dashboard: React.FC = () => {
         </div>
 
         {chartData.length > 0 ? (
-          <div className="h-64 w-full">
+          <div className="w-full h-64 min-h-[256px]">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <defs>

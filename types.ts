@@ -293,6 +293,13 @@ export interface EnhancedMealPrediction {
     impact: ImpactLevel;
     description: string;
   }[];
+  ml?: {
+    predicted_glucose: number;
+    confidence: "low" | "medium" | "high";
+    mode: string;
+    n: number;
+    delta?: number;
+  };
 }
 
 /**

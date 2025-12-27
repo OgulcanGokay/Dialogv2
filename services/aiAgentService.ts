@@ -23,6 +23,7 @@ import {
     SleepQuality,
     Intensity
 } from "../types";
+import { predictGlucose } from "./predictApi";
 import { isToday, isWithinDays } from "./dataService";
 
 // ============================================
@@ -224,18 +225,56 @@ export const buildHealthContext = (
  * Generate enhanced meal prediction using AI with health context
  */
 export const generateEnhancedPrediction = async (
-    apiKey: string,
-    mealAnalysis: MealAnalysis,
-    healthContext: HealthContext
+        apiKey: string,
+        mealAnalysis: MealAnalysis,
+        healthContext: HealthContext,
+        opts?: {
+            userId?: string;
+            mealType?: string; // "Breakfast"|"Lunch"|...
+            recentGlucose?: { ts?: string; value: number }[]; // 🔥 10–30 nokta
+        }
 ): Promise<EnhancedMealPrediction> => {
-    if (!apiKey) {
-        // Return a basic prediction without AI
-        return createBasicPrediction(mealAnalysis, healthContext);
-    }
+        // 0) ML (FastAPI /predict) - Gemini'den bağımsız dene
+        let mlResult: any = null;
 
-    const ai = new GoogleGenAI({ apiKey });
+        try {
+            const recent = opts?.recentGlucose || [];
+            if (recent.length >= 2) {
+                mlResult = await predictGlucose({
+                    user_id: opts?.userId || "001",
+                    meal_type: opts?.mealType || "Lunch",
+                    glucose: recent,
 
-    const prompt = `You are an expert diabetes health AI assistant. Analyze how this meal will affect the patient's glucose considering their current health context.
+                    calories: mealAnalysis.estimatedCalories || undefined,
+                    carbs: mealAnalysis.estimatedCarbs || undefined,
+                    protein: mealAnalysis.estimatedProtein || undefined,
+                    fat: mealAnalysis.estimatedFat || undefined,
+                    fiber: mealAnalysis.estimatedFiber || undefined,
+                });
+            }
+        } catch (e) {
+            console.warn("ML /predict failed, continuing:", e);
+        }
+
+        if (!apiKey) {
+                const basic = createBasicPrediction(mealAnalysis, healthContext);
+                return mlResult
+                    ? {
+                            ...basic,
+                            ml: {
+                                predicted_glucose: mlResult.predicted_glucose,
+                                confidence: mlResult.confidence,
+                                mode: mlResult.mode,
+                                n: mlResult.n,
+                                delta: mlResult.delta,
+                            },
+                        }
+                    : basic;
+        }
+
+        const ai = new GoogleGenAI({ apiKey });
+
+        const prompt = `You are an expert diabetes health AI assistant. Analyze how this meal will affect the patient's glucose considering their current health context.
 
 PATIENT PROFILE:
 - Diabetes Type: ${healthContext.diabetesType}
@@ -310,22 +349,46 @@ IMPORTANT: Return ONLY valid JSON, no markdown.`;
             });
         }
 
-        return {
-            basePrediction: mealAnalysis,
-            adjustedRisk: aiResult.adjustedRisk || healthContext.overallRisk,
-            contextualPrediction: aiResult.contextualPrediction || mealAnalysis.prediction,
-            glucoseEstimate: {
-                expectedPeak: aiResult.expectedPeakGlucose || 50,
-                peakTime: aiResult.peakTimeMinutes || 60,
-                returnToBaseline: aiResult.returnToBaselineMinutes || 120
-            },
-            recommendations: aiResult.recommendations || [],
-            warnings: aiResult.warnings || [],
-            factors
-        };
+                const result: EnhancedMealPrediction = {
+                        basePrediction: mealAnalysis,
+                        adjustedRisk: aiResult.adjustedRisk || healthContext.overallRisk,
+                        contextualPrediction: aiResult.contextualPrediction || mealAnalysis.prediction,
+                        glucoseEstimate: {
+                                expectedPeak: aiResult.expectedPeakGlucose || 50,
+                                peakTime: aiResult.peakTimeMinutes || 60,
+                                returnToBaseline: aiResult.returnToBaselineMinutes || 120
+                        },
+                        recommendations: aiResult.recommendations || [],
+                        warnings: aiResult.warnings || [],
+                        factors
+                };
+
+                if (mlResult) {
+                    result.ml = {
+                        predicted_glucose: mlResult.predicted_glucose,
+                        confidence: mlResult.confidence,
+                        mode: mlResult.mode,
+                        n: mlResult.n,
+                        delta: mlResult.delta,
+                    };
+                }
+
+                return result;
     } catch (error) {
-        console.error("AI Enhanced Prediction Error:", error);
-        return createBasicPrediction(mealAnalysis, healthContext);
+                console.error("AI Enhanced Prediction Error:", error);
+                const basic = createBasicPrediction(mealAnalysis, healthContext);
+                return mlResult
+                    ? {
+                            ...basic,
+                            ml: {
+                                predicted_glucose: mlResult.predicted_glucose,
+                                confidence: mlResult.confidence,
+                                mode: mlResult.mode,
+                                n: mlResult.n,
+                                delta: mlResult.delta,
+                            },
+                        }
+                    : basic;
     }
 };
 
