@@ -19,7 +19,9 @@ export type PredictRequest = {
 };
 
 export type PredictResponse = {
+  horizon_min?: number;
   mode: string;
+  mode_reason?: string | null;
   n: number;
   prediction: number;
   predicted_glucose: number;
@@ -30,12 +32,12 @@ export type PredictResponse = {
   features_used_cols?: string[] | null;
 };
 
-// env varsa onu kullan; yoksa frontend hangi host’taysa onun 8000’i
-const API_BASE =
-  (import.meta as any).env?.VITE_API_BASE || `http://${window.location.hostname}:8000`;
+// API base is env-only to keep a single source of truth
+const API_BASE = import.meta.env.VITE_API_BASE;
+if (!API_BASE) throw new Error("VITE_API_BASE is not configured");
 
-export async function predictGlucose(req: PredictRequest): Promise<PredictResponse> {
-  const r = await fetch(`${API_BASE}/predict`, {
+export async function predictGlucose(req: PredictRequest, horizonMin: number = 30): Promise<PredictResponse> {
+  const r = await fetch(`${API_BASE}/predict?horizon_min=${horizonMin}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),

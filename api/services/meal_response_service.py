@@ -1,154 +1,142 @@
 from __future__ import annotations
 
+from typing import Any
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import math
-
 import numpy as np
-import pandas as pd
 import joblib
+import pandas as pd
 
 
-_MEAL_OBJ = None
+# api klasöründen çalışınca "models/..." doğru resolve olur
+MODEL_PATH = Path("models/meal_response_rf.joblib")
+
+_MODEL = None
 
 
-def _base_dir() -> Path:
-    # api/ klasörü
-    return Path(__file__).resolve().parents[1]
+def _load():
+    global _MODEL
+    if _MODEL is None:
+        obj = joblib.load(MODEL_PATH)
+        # bizim script {"pipeline": pipe, "calib": ...} kaydetti
+        _MODEL = obj["pipeline"] if isinstance(obj, dict) and "pipeline" in obj else obj
+    return _MODEL
 
 
-def load_meal_model(model_path: Optional[str] = None):
-    global _MEAL_OBJ
-    if _MEAL_OBJ is not None:
-        return _MEAL_OBJ
-
-    if model_path is None:
-        model_path = str(_base_dir() / "models" / "meal_response_rf.joblib")
-
-    _MEAL_OBJ = joblib.load(model_path)
-    return _MEAL_OBJ
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
-def _tod_sin_cos(ts: pd.Timestamp) -> Tuple[float, float]:
-    minutes = ts.hour * 60 + ts.minute
-    angle = 2 * math.pi * (minutes / (24 * 60))
-    return float(math.sin(angle)), float(math.cos(angle))
-
-
-def _baseline_and_slope(
-    glucose_values: List[float],
-    timestamps: Optional[List[str]] = None,
-    baseline_minutes: int = 15,
-) -> Tuple[float, float]:
+def _tod_feats(ts_iso: str | None) -> tuple[float, float]:
     """
-    Baseline: pre-meal son 15 dk ortalama
-    Slope: pre-meal son 15 dk lineer eğim (mg/dL per min)
-    timestamps yoksa 5 dk sampling varsayımıyla yaklaşık hesaplar.
+    Timestamp varsa time-of-day sin/cos üret.
+    Yoksa 0 döner (Unknown).
     """
-    g = pd.to_numeric(pd.Series(glucose_values), errors="coerce").dropna().to_numpy()
-    if len(g) == 0:
+    if not ts_iso:
+        return 0.0, 0.0
+    try:
+        # ISO parse: "2025-12-28T00:22:..." gibi
+        import datetime as dt
+        t = dt.datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        minutes = t.hour * 60 + t.minute
+        angle = 2.0 * np.pi * (minutes / (24.0 * 60.0))
+        return float(np.sin(angle)), float(np.cos(angle))
+    except Exception:
         return 0.0, 0.0
 
-    # timestamps varsa son 15 dk'yı gerçekten seç
-    if timestamps:
-        ts = pd.to_datetime(pd.Series(timestamps), errors="coerce")
-        ok = ts.notna()
-        ts = ts[ok].reset_index(drop=True)
-        g2 = pd.Series(glucose_values)[ok].astype(float).to_numpy()
-        if len(ts) >= 3:
-            t_last = ts.iloc[-1]
-            w_mask = (ts >= (t_last - pd.Timedelta(minutes=baseline_minutes))) & (ts < t_last)
-            w_idx = np.where(w_mask.to_numpy())[0]
-            if len(w_idx) >= 3:
-                gw = g2[w_idx]
-                # baseline
-                base = float(np.mean(gw))
-                # slope
-                tmin = (ts.iloc[w_idx] - ts.iloc[w_idx[0]]).dt.total_seconds().to_numpy() / 60.0
-                slope = float(np.polyfit(tmin, gw, 1)[0])
-                return base, slope
 
-    # timestamps yok: 5 dk aralık varsay (15 dk ~ son 4 nokta)
-    k = min(len(g), 4)
-    gw = g[-k:]
-    base = float(np.mean(gw))
-
-    # slope için t = [0,5,10,15] veya k'ya göre
-    tmin = np.arange(k) * 5.0
-    if k >= 3:
-        slope = float(np.polyfit(tmin, gw, 1)[0])  # mg/dL per min
-    else:
-        slope = 0.0
-    return base, slope
-
-
-def predict_meal_response(
-    payload: Dict[str, Any],
-    model_path: Optional[str] = None,
-) -> Dict[str, Any]:
+def _build_curve(delta_peak: float, t_peak_min: float, decay_slope: float, max_min: int = 120, step: int = 5):
     """
-    payload beklenen alanlar:
-      - glucose_values: List[float]  (pre-meal history için)
-      - timestamps: Optional[List[str]] (varsa daha iyi)
-      - latest_ts: Optional[str] (yoksa timestamps[-1] kullanılmaya çalışılır)
-      - carbs/protein/fat/fiber/calories/amount_consumed/meal_type
+    Basit ama stabil bir curve generator:
+    - 0..t_peak: yükseliş
+    - t_peak..t_peak+15: plato
+    - sonrası: decay (exp)
+    decay_slope'ı doğrudan exp katsayısına çevirmek yerine clampleyip kullanıyoruz.
     """
-    obj = load_meal_model(model_path)
-    pipe = obj["pipeline"]
+    t_peak = float(np.clip(t_peak_min, 20.0, 200.0))
+    t_tail = t_peak + 15.0
 
-    glucose_values = payload.get("glucose_values") or []
-    timestamps = payload.get("timestamps")  # optional
+    # decay_slope ölçeği belirsiz olabildiği için güvenli clamp
+    k = float(np.clip(abs(decay_slope), 0.05, 1.5))
 
-    base, slope = _baseline_and_slope(glucose_values, timestamps=timestamps, baseline_minutes=15)
+    curve = []
+    for t in range(0, max_min + 1, step):
+        tf = float(t)
+        if tf <= t_peak:
+            x = tf / max(1e-6, t_peak)
+            delta = delta_peak * (x ** 1.6)
+        elif tf <= t_tail:
+            delta = delta_peak
+        else:
+            # peak'ten sonra sıfıra doğru sön (daha sonra settle ekleyebiliriz)
+            delta = delta_peak * np.exp(-k * (tf - t_tail) / 60.0)
+        curve.append({"t_min": int(t), "delta": float(delta)})
+    return curve
 
-    # zaman
-    latest_ts = payload.get("latest_ts")
-    if latest_ts:
-        t0 = pd.to_datetime(latest_ts, errors="coerce")
-    elif timestamps:
-        t0 = pd.to_datetime(timestamps[-1], errors="coerce")
-    else:
-        t0 = pd.Timestamp.now()
 
-    if pd.isna(t0):
-        t0 = pd.Timestamp.now()
+def predict_meal_response(req: dict[str, Any]) -> dict[str, Any]:
+    """
+    Input: frontend PredictRequest benzeri
+    Çıkış: curve + metrics
+    """
+    model = _load()
 
-    tod_sin, tod_cos = _tod_sin_cos(t0)
+    glucose = req.get("glucose") or []
+    if not glucose:
+        raise ValueError("glucose[] is required")
 
-    feats = {
-        "carbs": float(payload.get("carbs", 0.0) or 0.0),
-        "protein": float(payload.get("protein", 0.0) or 0.0),
-        "fat": float(payload.get("fat", 0.0) or 0.0),
-        "fiber": float(payload.get("fiber", 0.0) or 0.0),
-        "calories": float(payload.get("calories", 0.0) or 0.0),
-        "amount_consumed": float(payload.get("amount_consumed", 0.0) or 0.0),
-        "meal_type": str(payload.get("meal_type", "Unknown") or "Unknown"),
-        "baseline_glucose": float(base),
-        "premeal_slope": float(slope),
-        "tod_sin": float(tod_sin),
-        "tod_cos": float(tod_cos),
+    # last glucose + timestamp
+    last = glucose[-1]
+    last_val = float(last.get("value"))
+    last_ts = last.get("ts")
+
+    # dataset feature setine uygun alanlar
+    meal_type = req.get("meal_type") or "Unknown"
+    tod_sin, tod_cos = _tod_feats(last_ts)
+
+    X = [{
+        "carbs": _safe_float(req.get("carbs")),
+        "protein": _safe_float(req.get("protein")),
+        "fat": _safe_float(req.get("fat")),
+        "fiber": _safe_float(req.get("fiber")),
+        "calories": _safe_float(req.get("calories")),
+        "amount_consumed": _safe_float(req.get("amount_consumed")),
+        "baseline_glucose": last_val,
+        "premeal_slope": 0.0,  # şimdilik 0; istersen backend'de hesaplarız
+        "tod_sin": tod_sin,
+        "tod_cos": tod_cos,
+        "meal_type": meal_type,
+    }]
+
+    y = model.predict(pd.DataFrame(X))  # pipeline DataFrame bekliyor
+    # çıktı sırası train scriptte: d_peak, t_peak, auc_0_120, decay_slope
+    d_peak, t_peak, auc_0_120, decay_slope = [float(v) for v in y[0]]
+
+    curve = _build_curve(d_peak, t_peak, decay_slope, max_min=120, step=5)
+    curve_glucose = [{"t_min": p["t_min"], "delta": p["delta"], "glucose": float(last_val + p["delta"])} for p in curve]
+
+    metrics = {
+        "delta_peak": d_peak,
+        "t_peak_min": t_peak,
+        "auc_0_120": auc_0_120,
+        "decay_slope": decay_slope,
+        "predicted_peak_glucose": float(last_val + d_peak),
     }
-
-    X = pd.DataFrame([feats])
-    pred = pipe.predict(X)[0]  # [d_peak, t_peak, auc_0_120, decay_slope]
-
-    d_peak = float(pred[0])
-    t_peak = float(pred[1])
-    auc = float(pred[2])
-    decay = float(pred[3])
-
-    # basit confidence: veri azsa düşük
-    n = len(glucose_values)
-    confidence = "high" if n >= 12 else ("medium" if n >= 6 else "low")
 
     return {
         "mode": "meal_response",
-        "baseline_glucose": float(base),
-        "premeal_slope": float(slope),
-        "d_peak": d_peak,
-        "t_peak": t_peak,
-        "auc_0_120": auc,
-        "decay_slope": decay,
-        "predicted_peak_glucose": float(base + max(d_peak, 0.0)),
-        "confidence": confidence,
+        "baseline_glucose": float(last_val),
+        "premeal_slope": 0.0,
+        "d_peak": float(d_peak),
+        "t_peak": float(t_peak),
+        "auc_0_120": float(auc_0_120),
+        "decay_slope": float(decay_slope),
+        "predicted_peak_glucose": float(last_val + d_peak),
+        "confidence": "low",
+        "curve": curve_glucose,
+        "metrics": metrics,
     }

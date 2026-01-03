@@ -51,22 +51,22 @@ const AppContent: React.FC = () => {
         <div style={{ marginBottom: 12 }}>
           <button
             onClick={async () => {
+              console.log("API_BASE", import.meta.env.VITE_API_BASE);
               try {
+                // Generate 60 mins of sample data (12 points at 5-min intervals)
+                const now = new Date();
+                const sampleData = Array.from({ length: 12 }, (_, i) => {
+                  const ts = new Date(now.getTime() - (11 - i) * 5 * 60 * 1000);
+                  return {
+                    ts: ts.toISOString(),
+                    value: 120 + Math.floor(Math.random() * 30)
+                  };
+                });
+                
                 const r = await predictGlucose({
                   user_id: "001",
                   meal_type: "Lunch",
-                  glucose: [
-                    { ts: "2025-12-26T12:00:00", value: 120 },
-                    { ts: "2025-12-26T12:05:00", value: 125 },
-                    { ts: "2025-12-26T12:10:00", value: 131 },
-                    { ts: "2025-12-26T12:15:00", value: 128 },
-                    { ts: "2025-12-26T12:20:00", value: 135 },
-                    { ts: "2025-12-26T12:25:00", value: 140 },
-                    { ts: "2025-12-26T12:30:00", value: 142 },
-                    { ts: "2025-12-26T12:35:00", value: 145 },
-                    { ts: "2025-12-26T12:40:00", value: 147 },
-                    { ts: "2025-12-26T12:45:00", value: 150 },
-                  ],
+                  glucose: sampleData,
                 });
 
                 console.log("PREDICT:", r);

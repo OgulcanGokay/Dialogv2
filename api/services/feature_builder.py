@@ -3,18 +3,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 import numpy as np
+import pandas as pd
 import math
 from datetime import datetime
 
+def parse_ts(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
 # Modelin beklediği 28 kolon (sıra önemli değil ama biz sabit tutuyoruz)
 EXPECTED_COLS = [
-    "gl_lag_1", "gl_lag_2", "gl_lag_3", "gl_lag_5", "gl_lag_10", "gl_lag_15", "gl_lag_30",
-    "gl_slope_5", "gl_slope_15",
-    "gl_rm_5", "gl_rs_5", "gl_rm_15", "gl_rs_15", "gl_rm_30", "gl_rs_30",
-    "tod_sin", "tod_cos",
-    "HR", "METs",
-    "Calories (Activity)", "Calories", "Carbs", "Protein", "Fat", "Fiber",
-    "Amount Consumed", "Meal Type", "Steps"
+    "gl_lag_1","gl_lag_2","gl_lag_3","gl_lag_5","gl_lag_10","gl_lag_15","gl_lag_30","gl_lag_60","gl_lag_90","gl_lag_120",
+    "gl_ema_10","gl_ema_30","gl_ema_60",
+    "gl_slope_10","gl_slope_30","gl_slope_60",
+    "hour_sin","hour_cos",
+    "HR","METs","Calories (Activity)",
+    "Meal Type",
+    "Calories","Carbs","Protein","Fat","Fiber","Amount Consumed",
 ]
 
 @dataclass
@@ -22,40 +31,36 @@ class FeatureBuildResult:
     mode: str  # "full" | "fallback" | "min"
     features: Dict[str, object]  # float + Meal Type (str)
     features_used_cols: List[str]
+    mode_reason: Optional[str] = None  # debug: why fallback?
 
-def _safe_std(x: np.ndarray) -> float:
-    return float(x.std(ddof=0)) if len(x) > 0 else 0.0
-
-def _slope_last_k(arr: np.ndarray, k: int) -> float:
-    """Basit lineer eğim (index'e göre)."""
-    if len(arr) < k:
+def _ema_last(x: np.ndarray, w: int) -> float:
+    """Calculate EMA for the last w values."""
+    if len(x) < 2:
         return 0.0
-    y = arr[-k:]
-    x = np.arange(k, dtype=float)
-    # slope = cov(x,y)/var(x)
-    vx = x.var()
-    if vx == 0:
-        return 0.0
-    return float(((x - x.mean()) * (y - y.mean())).mean() / vx)
+    seg = x[max(0, len(x)-w):]
+    alpha = 2.0 / (w + 1.0)
+    v = float(seg[0])
+    for a in seg[1:]:
+        v = alpha * float(a) + (1 - alpha) * v
+    return float(v)
 
-def _tod_sin_cos(ts_iso: Optional[str]) -> Tuple[float, float]:
-    """
-    ISO timestamp varsa gün içi sin/cos üret.
-    Yoksa 0/0 döner (fallback).
-    """
-    if not ts_iso:
-        return 0.0, 0.0
-    try:
-        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
-        seconds = dt.hour * 3600 + dt.minute * 60 + dt.second
-        angle = 2.0 * math.pi * (seconds / 86400.0)
-        return float(math.sin(angle)), float(math.cos(angle))
-    except Exception:
-        return 0.0, 0.0
+def _slope_last(x: np.ndarray, w: int) -> float:
+    """Calculate slope for the last w values."""
+    seg = x[max(0, len(x)-w):]
+    if len(seg) < 2:
+        return 0.0
+    t = np.arange(len(seg), dtype=float)
+    return float(np.polyfit(t, seg.astype(float), 1)[0])
+
+def _hour_sin_cos(minute_of_day: int) -> Tuple[float, float]:
+    """Convert minute of day to sin/cos encoding."""
+    ang = 2.0 * np.pi * (minute_of_day / 1440.0)
+    return float(np.sin(ang)), float(np.cos(ang))
 
 def build_features(
     glucose_values: List[float],
     latest_ts: Optional[str] = None,
+    timestamps: Optional[List[str]] = None,
     meal_type: Optional[str] = None,
     hr: Optional[float] = None,
     mets: Optional[float] = None,
@@ -74,101 +79,80 @@ def build_features(
     """
 
     n = len(glucose_values)
-    if n == 0:
-        # boş gelmesin zaten endpoint kontrol ediyor ama yine de
-        features = {c: 0.0 for c in EXPECTED_COLS}
-        features["Meal Type"] = meal_type or "Unknown"
-        used = [
-            "gl_lag_1","gl_rm_5","gl_slope_5",
-            "tod_sin","tod_cos",
-            "Calories","Carbs","Steps","Meal Type"
-        ]
-        return FeatureBuildResult(mode="min", features=features, features_used_cols=used)
-
-    arr = np.array(glucose_values, dtype=float)
-
-    # mode kararı (senin prototip kararı)
-    if n >= 30:
-        mode = "full"
-    elif n >= 10:
-        mode = "fallback"
-    else:
-        mode = "min"
-
-    # Default row
-    features: Dict[str, object] = {c: 0.0 for c in EXPECTED_COLS}
-
-    # LAG'ler (yoksa 0 kalır)
-    def lag(i: int) -> float:
-        return float(arr[-1 - i]) if n > i else 0.0
-
-    features["gl_lag_1"]  = lag(1)
-    features["gl_lag_2"]  = lag(2)
-    features["gl_lag_3"]  = lag(3)
-    features["gl_lag_5"]  = lag(5)
-    features["gl_lag_10"] = lag(10)
-    features["gl_lag_15"] = lag(15)
-    features["gl_lag_30"] = lag(30)
-
-    # Rolling mean/std (kadar varsa hesapla, yoksa 0 kalır)
-    def tail(k: int) -> np.ndarray:
-        return arr[-k:] if n >= k else np.array([], dtype=float)
-
-    t5  = tail(5)
-    t15 = tail(15)
-    t30 = tail(30)
-
-    features["gl_rm_5"]  = float(t5.mean())  if len(t5)  else 0.0
-    features["gl_rs_5"]  = _safe_std(t5)
-    features["gl_rm_15"] = float(t15.mean()) if len(t15) else 0.0
-    features["gl_rs_15"] = _safe_std(t15)
-    features["gl_rm_30"] = float(t30.mean()) if len(t30) else 0.0
-    features["gl_rs_30"] = _safe_std(t30)
-
-    # Slope (5 ve 15) - require at least 2 points
-    features["gl_slope_5"]  = _slope_last_k(arr, 5)  if n >= 2 else 0.0
-    features["gl_slope_15"] = _slope_last_k(arr, 15) if n >= 2 else 0.0
-
-    # Time-of-day sin/cos
-    tod_sin, tod_cos = _tod_sin_cos(latest_ts)
-    features["tod_sin"] = tod_sin
-    features["tod_cos"] = tod_cos
-
-    # Dış kaynak feature’ları (yoksa 0)
-    features["HR"] = float(hr) if hr is not None else 0.0
-    features["METs"] = float(mets) if mets is not None else 0.0
-    features["Steps"] = float(steps) if steps is not None else 0.0
-    features["Calories (Activity)"] = float(calories_activity) if calories_activity is not None else 0.0
-
-    # Makrolar (yoksa 0)
-    features["Calories"] = float(calories) if calories is not None else 0.0
-    features["Carbs"] = float(carbs) if carbs is not None else 0.0
-    features["Protein"] = float(protein) if protein is not None else 0.0
-    features["Fat"] = float(fat) if fat is not None else 0.0
-    features["Fiber"] = float(fiber) if fiber is not None else 0.0
-    features["Amount Consumed"] = float(amount_consumed) if amount_consumed is not None else 0.0
-
-    # Categorical
+    
+    # glucose_values -> np array
+    g_raw = np.array(glucose_values, dtype=float)
+    
+    # NaN temizle
+    if np.any(~np.isfinite(g_raw)):
+        s = pd.Series(g_raw).interpolate(limit_direction="both").bfill().ffill()
+        g_raw = s.to_numpy(dtype=float)
+    
+    # ✅ training ile aynı dağılım: median-center
+    med = float(np.nanmedian(g_raw)) if len(g_raw) else 0.0
+    g = g_raw - med
+    
+    # lags (yoksa 0)
+    def lag(L: int) -> float:
+        return float(g[-L]) if n > L else 0.0
+    
+    features = {
+        "gl_lag_1": lag(1),
+        "gl_lag_2": lag(2),
+        "gl_lag_3": lag(3),
+        "gl_lag_5": lag(5),
+        "gl_lag_10": lag(10),
+        "gl_lag_15": lag(15),
+        "gl_lag_30": lag(30),
+        "gl_lag_60": lag(60),
+        "gl_lag_90": lag(90),
+        "gl_lag_120": lag(120),
+        "gl_ema_10": _ema_last(g, 10),
+        "gl_ema_30": _ema_last(g, 30),
+        "gl_ema_60": _ema_last(g, 60),
+        "gl_slope_10": _slope_last(g, 10),
+        "gl_slope_30": _slope_last(g, 30),
+        "gl_slope_60": _slope_last(g, 60),
+    }
+    
+    # minute_of_day: latest_ts varsa oradan, yoksa 0
+    minute_of_day = 0
+    if latest_ts:
+        try:
+            ts = pd.to_datetime(latest_ts)
+            minute_of_day = int(ts.hour * 60 + ts.minute)
+        except Exception:
+            minute_of_day = 0
+    
+    hs, hc = _hour_sin_cos(minute_of_day)
+    features["hour_sin"] = hs
+    features["hour_cos"] = hc
+    
+    # activity + meal + macros (yoksa 0)
+    features["HR"] = float(hr or 0.0)
+    features["METs"] = float(mets or 0.0)
+    features["Calories (Activity)"] = float(calories_activity or 0.0)
     features["Meal Type"] = meal_type or "Unknown"
-
-    # Determine which columns were effectively used depending on mode
-    if mode == "full":
-        used = EXPECTED_COLS.copy()
-    elif mode == "fallback":
-        used = [
-            "gl_lag_1","gl_lag_2","gl_lag_3","gl_lag_5","gl_lag_10","gl_lag_15",
-            "gl_slope_5","gl_slope_15",
-            "gl_rm_5","gl_rs_5","gl_rm_15","gl_rs_15",
-            "tod_sin","tod_cos",
-            "HR","METs","Steps","Calories (Activity)",
-            "Calories","Carbs","Protein","Fat","Fiber",
-            "Amount Consumed","Meal Type"
-        ]
-    else:  # min
-        used = [
-            "gl_lag_1","gl_rm_5","gl_slope_5",
-            "tod_sin","tod_cos",
-            "Calories","Carbs","Steps","Meal Type"
-        ]
-
-    return FeatureBuildResult(mode=mode, features=features, features_used_cols=used)
+    
+    features["Calories"] = float(calories or 0.0)
+    features["Carbs"] = float(carbs or 0.0)
+    features["Protein"] = float(protein or 0.0)
+    features["Fat"] = float(fat or 0.0)
+    features["Fiber"] = float(fiber or 0.0)
+    features["Amount Consumed"] = float(amount_consumed or 0.0)
+    
+    # ✅ en kritik satır: tüm kolonlar var mı garanti et
+    for c in EXPECTED_COLS:
+        if c not in features:
+            features[c] = 0.0
+    
+    # Mode determination
+    mode = "full"
+    mode_reason = None
+    
+    return FeatureBuildResult(
+        mode=mode,
+        features=features,
+        features_used_cols=EXPECTED_COLS.copy(),
+        mode_reason=mode_reason
+    )

@@ -16,11 +16,29 @@ const Dashboard: React.FC = () => {
   const [glucoseNotes, setGlucoseNotes] = useState('');
   const [glucoseTrend, setGlucoseTrend] = useState<GlucoseTrend>('stable');
 
+  // Helper function to get current minute of day
+  function minuteOfDayNow(): number {
+    const now = new Date();
+    return now.getHours() * 60 + now.getMinutes();
+  }
+
   const stats = getDailyStats();
   const todaysMeals = getTodaysMeals();
-  const currentGlucose = glucose.length > 0 ? glucose[0] : null;
-  const currentValue = currentGlucose?.value || 0;
-  const inRange = currentValue >= user.targetRange.min && currentValue <= user.targetRange.max;
+  
+  // Transform glucose data for chart (all template data, sorted)
+  const sorted = [...glucose].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+
+  // ============================================
+  // Detect worst 1-min drop
+  // ============================================ ============================================
+
+  // Current glucose = minNow index in sorted array
+  const minNow = minuteOfDayNow();
+  const currentNow = sorted[minNow] ?? sorted.at(-1) ?? null;
+  const currentValue = currentNow ? Math.round(currentNow.value) : "--";
+  const inRange = typeof currentValue === 'number' && currentValue >= user.targetRange.min && currentValue <= user.targetRange.max;
 
   // Build health context
   useEffect(() => {
@@ -28,15 +46,12 @@ const Dashboard: React.FC = () => {
     setHealthContext(context);
   }, [user, sleep, moods, activities, meals]);
 
-  // Transform glucose data for chart (last 24 readings, sorted chronologically)
-  const chartData = [...glucose]
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-    .slice(-24) // Take the last 24 readings
-    .map((g, index) => ({
-      time: new Date(g.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  // Transform glucose data for chart (all template data, sorted)
+  const chartData = sorted
+    .filter((_, i) => i % 5 === 0)  // 5-minute downsample
+    .map((g) => ({
+      ts: g.timestamp,
       glucose: g.value,
-      trend: g.trend,
-      index: index
     }));
 
   const warnings = healthContext ? getPreMealWarnings(healthContext) : [];
@@ -59,9 +74,10 @@ const Dashboard: React.FC = () => {
   );
 
   const getGlucoseStatus = () => {
-    if (!currentGlucose) return { text: 'No data', color: 'text-slate-400' };
-    if (currentValue < user.targetRange.min) return { text: 'Low', color: 'text-red-500' };
-    if (currentValue > user.targetRange.max) return { text: 'High', color: 'text-orange-500' };
+    if (!currentNow) return { text: 'No data', color: 'text-slate-400' };
+    const val = currentNow.value;
+    if (val < user.targetRange.min) return { text: 'Low', color: 'text-red-500' };
+    if (val > user.targetRange.max) return { text: 'High', color: 'text-orange-500' };
     return { text: 'In Range', color: 'text-emerald-500' };
   };
 
@@ -129,7 +145,7 @@ const Dashboard: React.FC = () => {
       {/* Prediction quick action */}
       <div className="mb-4">
         <button
-          onClick={runPrediction}
+          onClick={() => runPrediction()}
           disabled={predictionLoading}
           className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-60"
         >
@@ -139,11 +155,34 @@ const Dashboard: React.FC = () => {
         {predictionError && <p className="text-red-500 mt-2">{predictionError}</p>}
 
         {predictionResult && (
-          <div className="mt-3 p-3 bg-white rounded-xl border border-slate-100 inline-block">
-            <p className="text-sm">Mode: {predictionResult.mode} (n={predictionResult.n})</p>
-            <p className="text-sm">Last: {predictionResult.last}</p>
-            <p className="text-sm">Δ Pred: {predictionResult.delta.toFixed(2)}</p>
-            <p className="text-sm font-bold">Predicted: {predictionResult.predicted.toFixed(2)}</p>
+          <div className="mt-3 space-y-2">
+            {predictionResult.map((pred, idx) => (
+              <div key={idx} className="p-4 bg-white rounded-xl border border-slate-100 inline-block mr-3">
+                <p className="text-sm font-bold text-blue-600 mb-2">{pred.horizon_min} min Prediction</p>
+                <p className="text-sm">Mode: {pred.mode} (n={pred.n})</p>
+                {pred.mode === "min" && (
+                  <p className="text-xs text-amber-600 font-semibold">Not enough data</p>
+                )}
+                <p className="text-sm">Last: {Math.round(pred.last)} mg/dL</p>
+                
+                {/* ✅ NEW: Meal effect decomposition */}
+                <div className="mt-2 pt-2 border-t border-slate-200 space-y-1">
+                  <p className="text-sm font-semibold">
+                    Total Predicted: <span className="text-blue-700">{Math.round(pred.predicted_total)}</span> mg/dL
+                  </p>
+                  <p className="text-xs text-slate-600">
+                    Baseline Δ (no meal): {Math.round(pred.delta_base)} mg/dL
+                  </p>
+                  <p className="text-xs text-slate-600">
+                    Meal Effect Δ: <span className={pred.delta_meal >= 0 ? "text-green-600" : "text-red-600"}>
+                      {pred.delta_meal > 0 ? "+" : ""}{Math.round(pred.delta_meal)}
+                    </span> mg/dL
+                  </p>
+                </div>
+                
+                {pred.confidence && <p className="text-xs text-slate-500 mt-2">Confidence: {pred.confidence}</p>}
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -366,7 +405,7 @@ const Dashboard: React.FC = () => {
                     reading.value > user.targetRange.max ? 'bg-orange-100 text-orange-600' :
                       'bg-emerald-100 text-emerald-600'
                     }`}>
-                    {reading.value}
+                    {Math.round(reading.value)}
                   </div>
                   <div>
                     <p className="text-sm font-medium text-slate-700">
@@ -415,8 +454,8 @@ const Dashboard: React.FC = () => {
         </div>
 
         {chartData.length > 0 ? (
-          <div className="w-full h-64 min-h-[256px]">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="w-full" style={{ height: 260 }}>
+            <ResponsiveContainer width="100%" height={260}>
               <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <defs>
                   <linearGradient id="colorGlucose" x1="0" y1="0" x2="0" y2="1">
@@ -426,28 +465,33 @@ const Dashboard: React.FC = () => {
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                 <XAxis
-                  dataKey="index"
+                  dataKey="ts"
                   tick={{ fontSize: 12, fill: '#94a3b8' }}
                   axisLine={false}
                   tickLine={false}
-                  interval="preserveStartEnd"
-                  tickFormatter={(index) => chartData[index]?.time || ''}
+                  interval={Math.max(0, Math.floor(chartData.length / 12))}
+                  tickFormatter={(ts) =>
+                    new Date(ts).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+                  }
                 />
                 <YAxis
-                  domain={['auto', 'auto']}
+                  domain={['dataMin - 5', 'dataMax + 5']}
                   tick={{ fontSize: 12, fill: '#94a3b8' }}
                   axisLine={false}
                   tickLine={false}
                 />
                 <Tooltip
                   contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)', backgroundColor: 'white', padding: '8px 12px' }}
+                  labelFormatter={(ts) =>
+                    new Date(ts).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+                  }
                   content={({ active, payload }) => {
                     if (active && payload && payload.length > 0) {
                       const data = payload[0].payload;
                       return (
                         <div className="bg-white rounded-lg shadow-lg p-2 border border-slate-100">
-                          <p className="text-xs text-slate-500">{data.time}</p>
-                          <p className="text-lg font-bold text-orange-500">{data.glucose} mg/dL</p>
+                          <p className="text-xs text-slate-500">{new Date(data.ts).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</p>
+                          <p className="text-lg font-bold text-orange-500">{Math.round(data.glucose)} mg/dL</p>
                         </div>
                       );
                     }

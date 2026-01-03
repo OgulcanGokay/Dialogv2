@@ -4,10 +4,12 @@
 // ============================================
 
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import Papa from "papaparse";
 import {
     UserProfile,
     MealEntry,
     GlucoseEntry,
+    GlucoseTrend,
     ActivityEntry,
     MoodEntry,
     SleepEntry,
@@ -18,10 +20,48 @@ import {
 } from '../types';
 import * as dataService from '../services/dataService';
 import { predictGlucose, predictMealResponse } from '../services/predictApi';
+import { loadTemplate2Day } from '../services/template2day';
+import { build24hSeriesFrom2DayTemplate, build24hSeriesFrom2DayTemplateFull } from '../services/windowBuilder';
+import type { TemplateRow } from '../services/template2day';
+import type { MealEvent } from '../services/mealLogTypes';
+import { predictFromTemplate } from '../services/predictTemplate';
+
+const API_BASE = import.meta.env.VITE_API_BASE;
+if (!API_BASE) {
+    throw new Error("VITE_API_BASE is not configured");
+}
+
+// ============================================
+// Expected Feature Columns (matches backend's 28 columns)
+// ============================================
+const EXPECTED_COLS = [
+    "gl_lag_1","gl_lag_2","gl_lag_3","gl_lag_5","gl_lag_10","gl_lag_15","gl_lag_30",
+    "gl_slope_5","gl_slope_15",
+    "gl_rm_5","gl_rs_5","gl_rm_15","gl_rs_15","gl_rm_30","gl_rs_30",
+    "tod_sin","tod_cos",
+    "HR","METs","Calories (Activity)",
+    "Calories","Carbs","Protein","Fat","Fiber","Amount Consumed","Meal Type","Steps"
+];
+
+function validateCols(gotCols: string[], tag: string) {
+    const expectedSet = new Set(EXPECTED_COLS);
+    const gotSet = new Set(gotCols);
+
+    const missing = EXPECTED_COLS.filter(c => !gotSet.has(c));
+    const extra = gotCols.filter(c => !expectedSet.has(c));
+
+    if (missing.length || extra.length) {
+        console.warn(`${tag} ⚠️ COLS MISMATCH`, { missing, extra });
+    } else {
+        console.log(`${tag} ✅ COLS OK`);
+    }
+}
 
 // ============================================
 // Context Types
 // ============================================
+
+type DemoPoint = { ts: string; value: number };
 
 interface AppContextType {
     // State
@@ -33,6 +73,8 @@ interface AppContextType {
     sleep: SleepEntry[];
     isLoading: boolean;
     apiKey: string;
+    templateRows: TemplateRow[];
+    mealLog: MealEvent[];
 
     // User Actions
     updateUser: (updates: Partial<UserProfile>) => void;
@@ -76,14 +118,22 @@ interface AppContextType {
     };
 
     // Prediction state/actions
-    predictionResult: null | {
+    predictionResult: null | Array<{
+        horizon_min: number;
         mode: "full" | "fallback" | "min";
-        delta: number;
-        predicted: number;
+        delta: number;  // Legacy: delta_meal for backward compat
+        predicted: number;  // Legacy: predicted_total for backward compat
         last: number;
         n: number;
         confidence?: "low" | "medium" | "high";
-    };
+        // ✅ NEW: Meal effect decomposition
+        delta_total: number;
+        delta_base: number;
+        delta_meal: number;
+        predicted_total: number;
+        predicted_base: number;
+        predicted_meal: number;
+    }>;
     predictionLoading: boolean;
     predictionError: string | null;
     runPrediction: () => Promise<void>;
@@ -135,16 +185,19 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const [apiKey, setApiKeyState] = useState<string>(
         localStorage.getItem('gemini_api_key') || ''
     );
+    const [templateRows, setTemplateRows] = useState<TemplateRow[]>([]);
+    const [mealLog, setMealLog] = useState<MealEvent[]>([]);
 
     // Prediction UI state
-    const [predictionResult, setPredictionResult] = useState<null | {
+    const [predictionResult, setPredictionResult] = useState<null | Array<{
+        horizon_min: number;
         mode: "full" | "fallback" | "min";
         delta: number;
         predicted: number;
         last: number;
         n: number;
         confidence?: "low" | "medium" | "high";
-    }>(null);
+    }>>(null);
     const [predictionLoading, setPredictionLoading] = useState<boolean>(false);
     const [predictionError, setPredictionError] = useState<string | null>(null);
 
@@ -163,6 +216,13 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const [mealResponseLoading, setMealResponseLoading] = useState<boolean>(false);
     const [mealResponseError, setMealResponseError] = useState<string | null>(null);
 
+    // Utility functions
+    function minuteOfDayNow(): number {
+        const now = new Date();
+        return now.getHours() * 60 + now.getMinutes();
+    }
+
+
     // ============================================
     // Initial Data Load
     // ============================================
@@ -171,11 +231,9 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         const loadData = () => {
             setIsLoading(true);
             try {
-                // Initialize demo data if needed
-                dataService.initializeDemoData();
-
                 // Load all data
                 const data = dataService.loadAllData();
+                console.log("[CTX] source=manual", "len=", data.glucose.length, "sample=", data.glucose[0]);
                 setUser(data.user);
                 setMeals(data.meals);
                 setGlucose(data.glucose);
@@ -191,6 +249,62 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
         loadData();
     }, []);
+
+    // Load template on startup
+    useEffect(() => {
+        loadTemplate2Day().then(setTemplateRows).catch(console.error);
+    }, []);
+
+    // Generate glucose from templateRows (Full Day2 - 1440 points, no downsampling)
+    useEffect(() => {
+        if (!templateRows || templateRows.length === 0) return;
+
+        const full = build24hSeriesFrom2DayTemplateFull(templateRows);
+        const entries: GlucoseEntry[] = full.map((p: any, i: number) => ({
+            id: `tmpl-day2-${i}`,
+            timestamp: p.ts,
+            value: p.value,
+            source: "simulated",
+            trend: "stable" as GlucoseTrend,
+        }));
+        
+        setGlucose(entries);
+
+        const minNow = minuteOfDayNow();
+        console.log("[DBG] minNow=", minNow);
+        console.log("[DBG] should match predict last:", full[minNow]?.ts, full[minNow]?.value);
+        console.log("[CTX] source=template full", "len=", entries.length, "sample=", entries[0]);
+
+        // ============================================
+        // 30-second validation: Detect worst 1-min drop
+        // ============================================
+        const sorted = [...entries].sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+        );
+
+        const values = sorted.map(x => x.value);
+        const minV = Math.min(...values);
+        const maxV = Math.max(...values);
+        let worstDrop = { drop: 0, at: 0 };
+
+        for (let i = 1; i < values.length; i++) {
+            const drop = values[i - 1] - values[i];
+            if (drop > worstDrop.drop) worstDrop = { drop, at: i };
+        }
+
+        console.log("[DAY2] min/max:", minV, maxV);
+        console.log("[DAY2] worst 1-min drop:", worstDrop.drop,
+            "from", sorted[worstDrop.at - 1].timestamp, values[worstDrop.at - 1],
+            "to", sorted[worstDrop.at].timestamp, values[worstDrop.at]
+        );
+
+        if (worstDrop.drop > 50) {
+            console.warn("[DAY2-WARNING] Large drop detected (>50 mg/dL in 1 min) - likely sensor artifact");
+        } else if (worstDrop.drop > 20) {
+            console.info("[DAY2-INFO] Moderate drop detected (" + worstDrop.drop + " mg/dL in 1 min)");
+        }
+        // ============================================
+    }, [templateRows]);
 
     // ============================================
     // User Actions
@@ -476,62 +590,113 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
             setPredictionLoading(true);
             setPredictionError(null);
 
-            // 1) sort by timestamp (safe) + take last 30
-            const sorted = [...glucose].sort(
-                (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-            );
-            const recent = sorted.slice(-30);
+            console.log("[Predict] Using TEMPLATE as primary source (photo optional).");
 
-            if (recent.length < 1) {
+            // ✅ TEMPLATE FLOW
+            if (templateRows.length > 0) {
+                const common = {
+                    baseUrl: API_BASE,
+                    templateRows,
+                    mealLog,
+                };
+
+                const MEAL_ZERO = {
+                    meal_type: "Unknown",
+                    carbs: 0,
+                    calories: 0,
+                    protein: 0,
+                    fat: 0,
+                    fiber: 0,
+                    amount_consumed: 0,
+                };
+
+                // 6 calls: TOTAL (3 horizons) + BASELINE (3 horizons)
+                const [r30, r60, r120, b30, b60, b120] = await Promise.all([
+                    // TOTAL
+                    predictFromTemplate({ ...common, horizonMin: 30 }),
+                    predictFromTemplate({ ...common, horizonMin: 60 }),
+                    predictFromTemplate({ ...common, horizonMin: 120 }),
+
+                    // BASELINE (meal=0)
+                    predictFromTemplate({ ...common, horizonMin: 30, mealOverride: MEAL_ZERO }),
+                    predictFromTemplate({ ...common, horizonMin: 60, mealOverride: MEAL_ZERO }),
+                    predictFromTemplate({ ...common, horizonMin: 120, mealOverride: MEAL_ZERO }),
+                ]);
+
+                const d = (x: any) => Number(x?.delta ?? x?.prediction ?? 0);
+
+                console.log("[MealEffect] h30", { total: d(r30), base: d(b30), meal: d(r30) - d(b30) });
+                console.log("[MealEffect] h60", { total: d(r60), base: d(b60), meal: d(r60) - d(b60) });
+                console.log("[MealEffect] h120", { total: d(r120), base: d(b120), meal: d(r120) - d(b120) });
+
+                // Helper functions
+                const getDelta = (resp: any) => Number(resp.delta ?? resp.prediction ?? 0);
+                const getLast = (resp: any) => Number(resp.last_glucose ?? resp.last ?? 0);
+
+                const totals = [r30, r60, r120];
+                const bases = [b30, b60, b120];
+                const horizons = [30, 60, 120];
+
+                // Calculate meal effect for each horizon
+                const results = horizons.map((h, i) => {
+                    const total = totals[i];
+                    const base = bases[i];
+
+                    const last = getLast(total) || getLast(base);
+                    const delta_total = getDelta(total);
+                    const delta_base = getDelta(base);
+                    const delta_meal = delta_total - delta_base;
+
+                    return {
+                        horizon_min: total.horizon_min ?? h,
+                        mode: (total.mode ?? "full") as "full" | "fallback" | "min",
+                        confidence: total.confidence ?? "low",
+                        n: total.n ?? 720,
+                        last,
+                        delta_total,
+                        delta_base,
+                        delta_meal,
+                        predicted_total: last + delta_total,
+                        predicted_base: last + delta_base,
+                        predicted_meal: last + delta_meal,
+                    };
+                });
+
+                // Keep legacy fields for backward compatibility
+                const legacyResults = results.map((r: any) => ({
+                    ...r,
+                    delta: r.delta_meal,  // For UI backward compat
+                    predicted: r.predicted_total,  // For UI backward compat
+                }));
+
+                setPredictionResult(legacyResults as any);
                 setPredictionLoading(false);
-                setPredictionError('No glucose data to predict.');
                 return;
             }
 
-            const payload = {
-                user_id: user?.id ?? '001',
-                meal_type: 'Lunch',
-                glucose: recent.map((g) => ({ ts: g.timestamp, value: g.value })),
-            };
-
-            const r = await predictGlucose(payload);
-
-            const last = r.last_glucose ?? recent[recent.length - 1].value;
-            const predicted = r.predicted_glucose ?? (last + r.prediction);
-
-            console.log("Predict response r:", r);
-            console.log("computed last/predicted:", { last, predicted });
-
-            setPredictionResult({
-                mode: r.mode,
-                delta: r.prediction,
-                predicted,
-                last,
-                n: r.n,
-                confidence: r.confidence,
-            });
-
+            // Template not loaded fallback
             setPredictionLoading(false);
+            setPredictionError("Template not loaded yet.");
         } catch (e: any) {
             setPredictionLoading(false);
-            setPredictionError(e?.message ?? 'Prediction failed');
+            setPredictionError(e?.message ?? "Prediction failed");
         }
-    }, [glucose, user]);
+    }, [templateRows, mealLog]);
 
     const runMealResponsePrediction = useCallback(async () => {
         try {
             setMealResponseLoading(true);
             setMealResponseError(null);
 
-            // aynı şekilde son 30 glukoz noktası
+            // aynı şekilde son 720 glukoz noktası (12 saat)
             const sorted = [...glucose].sort(
                 (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
             );
-            const recent = sorted.slice(-30);
-
-            if (recent.length < 3) {
+            const recent = sorted.slice(-720);
+            console.log("[MealResp] glucose state len:", glucose.length, "sorted len:", sorted.length, "recent len:", recent.length);
+            if (recent.length < 120) {
                 setMealResponseLoading(false);
-                setMealResponseError('Not enough glucose data (need at least 3 points).');
+                setMealResponseError('Not enough glucose points (need >= 120).');
                 return;
             }
 
@@ -549,6 +714,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
                 fiber: lastMeal?.analysis?.estimatedFiber ?? 0,
                 amount_consumed: 1,
             };
+            console.log("[MealResp] recent oldest/newest:", recent[0], recent[recent.length - 1]);
+            console.table(payload.glucose.slice(0, 10));
 
             const r = await predictMealResponse(payload);
 
@@ -585,6 +752,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         sleep,
         isLoading,
         apiKey,
+        templateRows,
+        mealLog,
 
         // User Actions
         updateUser,

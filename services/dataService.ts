@@ -443,15 +443,16 @@ export const generateDemoGlucoseData = (): GlucoseEntry[] => {
     const entries: GlucoseEntry[] = [];
     const now = new Date();
 
-    // Generate 24 hours of simulated CGM data
-    for (let i = 23; i >= 0; i--) {
+    // Generate 24 hours of simulated CGM data at 1-minute resolution (1440 points)
+    const totalMinutes = 24 * 60;
+    for (let i = totalMinutes - 1; i >= 0; i--) {
         const timestamp = new Date(now);
-        timestamp.setHours(now.getHours() - i);
+        timestamp.setMinutes(now.getMinutes() - i);
 
         let value = 110;
         const hour = timestamp.getHours();
 
-        // Simulate meal spikes
+        // Simulate meal spikes by hour window
         if (hour >= 8 && hour <= 10) value += 60;   // Breakfast
         if (hour >= 13 && hour <= 15) value += 40;  // Lunch
         if (hour >= 19 && hour <= 21) value += 50;  // Dinner
@@ -473,9 +474,29 @@ export const generateDemoGlucoseData = (): GlucoseEntry[] => {
     return entries;
 };
 
+// Detects coarse (e.g., hourly) demo data; re-seed if too sparse
+const needsReseedGlucose = (entries: GlucoseEntry[]): boolean => {
+    if (!entries || entries.length < 300) return true; // less than ~5h at 1-min
+    const sorted = [...entries].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+    let totalGap = 0;
+    let gaps = 0;
+    for (let i = 1; i < sorted.length; i++) {
+        const gapMs = new Date(sorted[i].timestamp).getTime() - new Date(sorted[i - 1].timestamp).getTime();
+        if (!Number.isNaN(gapMs) && gapMs > 0) {
+            totalGap += gapMs;
+            gaps += 1;
+        }
+    }
+    if (gaps === 0) return true;
+    const avgGapMin = totalGap / gaps / 60000;
+    return avgGapMin > 10; // anything coarser than ~10 minutes triggers reseed
+};
+
 export const initializeDemoData = (): void => {
-    // Only initialize if no glucose data exists
-    if (loadGlucose().length === 0) {
+    const existing = loadGlucose();
+    if (existing.length === 0 || needsReseedGlucose(existing)) {
         const demoGlucose = generateDemoGlucoseData();
         saveGlucose(demoGlucose);
     }
